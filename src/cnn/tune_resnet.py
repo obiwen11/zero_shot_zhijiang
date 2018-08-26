@@ -8,7 +8,7 @@ Created on Tue Aug 14 00:18:03 2018
 import time
 from datetime import datetime
 import numpy as np
-
+import pandas as pd
 from sklearn.utils import shuffle
 
 import tensorflow as tf
@@ -24,28 +24,51 @@ attr_txt = 'attribute_list.txt'
 lblattr_txt = 'attributes_per_class.txt'
 lblemb_txt = 'class_wordembeddings.txt'
 
-imgpath_list, label_list, attr_list, df_attr, df_lblattr = utils.load_pair(datadirect, train_txt, attr_txt, lblattr_txt)
-imgpath_list, label_list, attr_list = shuffle(imgpath_list, label_list, attr_list, random_state=731)
+##################preparation pipelines#######################
+df_lbl = utils.load_label(datadirect, label_txt)
+num_classes = df_lbl.shape[0]
 
-imgnum = len(imgpath_list)
-attrnum = len(attr_list[0])
-lblmap, num_classes = utils.load_map(datadirect, label_txt)
+df_pair = utils.load_pair(datadirect, train_txt)
+df_pair = pd.merge(df_pair, df_lbl, on='label_code', how='left')
+imgnum = df_pair.shape[0]
 
-filenames, labels, attrs = tf.constant(imgpath_list), tf.constant(label_list), tf.constant(attr_list)
+df_attrname, df_lblattr = utils.load_attr(datadirect, attr_txt, lblattr_txt)
+df_attr = pd.merge(df_pair[['label_code']], df_lblattr, on='label_code', how='left')
+attrnum = df_attrname.shape[0]
 
-                
+df_lblattr = pd.merge(df_lblattr, df_lbl, on='label_code', how='left')
+adj_attrsim = utils.create_adjattr(df_lblattr, num_classes)
+
+df_lblemb = utils.load_emb(datadirect, lblemb_txt)
+df_lblemb = pd.merge(df_lblemb, df_lbl, on='label_name', how='left')
+
+adj_embsim = utils.create_adjemb(df_lblemb, num_classes)
+
+imagepath_list = df_pair['image_path'].tolist()
+label_list = df_pair['label_index'].tolist()
+attr_list = df_attr.iloc[:, 1:].values.tolist()
+
+imagepath_list, label_list, attr_list = shuffle(imagepath_list, label_list, attr_list, random_state=731)
+
+files, labels, attrs = tf.constant(imagepath_list), tf.constant(label_list), tf.constant(attr_list)
+     
+           
 def main():
     tf.set_random_seed(731)
     
     Epoch = 200
-    Batch_Size = 64
+    Batch_Size = 8
     Lr = 1e-4
     Epoch_Step = int(imgnum/Batch_Size)
-    Beta = 3
+    Beta1 = 3
+    Beta2 = 0.1
     Val_Per = 0.2
     Patience = 5
     
-    dataset = utils.make_dataset(filenames, labels, attrs, Epoch, Batch_Size, is_training=True)
+    adj_attr = np.repeat(adj_attrsim[np.newaxis, :, :], Batch_Size, axis=0)
+    adj_emb = np.repeat(adj_embsim[np.newaxis, :, :], Batch_Size, axis=0)
+    
+    dataset = utils.make_dataset(files, labels, attrs, Epoch, Batch_Size, is_training=True)
     
     iterator = dataset.make_one_shot_iterator()
     next_example, next_label, next_attr = iterator.get_next()
@@ -73,7 +96,13 @@ def main():
     class_loss = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=next_label, logits=class_logits))
     attr_loss = tf.reduce_mean(tf.reduce_sum(tf.pow(tf.subtract(next_attr, attr_logits), 2), axis=1))
     
-    loss = class_loss + Beta * attr_loss
+    class_actv = tf.squeeze(class_conv, axis=[1])
+    attrsim_loss = tf.reduce_mean(tf.multiply(tf.multiply(class_actv, adj_attr), tf.transpose(class_actv, perm=[0,2,1])))
+    embsim_loss = tf.reduce_mean(tf.multiply(tf.multiply(class_actv, adj_emb), tf.transpose(class_actv, perm=[0,2,1])))
+    
+    sim_loss = attrsim_loss + embsim_loss
+    
+    loss = class_loss + Beta1 * attr_loss + Beta2 * sim_loss
     
 #    finetune_names = ['block3', 'block4', 'class_conv', 'attr_conv']
 #    unrestore_names = ['class_conv', 'attr_conv']
@@ -100,10 +129,10 @@ def main():
         epoch_loss = {'train':[], 'val':[]}
         for step in range(Epoch_Step):
             if (step + 1) / Epoch_Step <= (1 - Val_Per):
-                loss_= sess.run(loss)
+                loss_, sim_loss_ = sess.run([loss, sim_loss])
                 epoch_loss['train'].append(loss_)
-                if step and not step % 10:
-                    print('step:{}, loss:{}'.format(step, loss_))
+                if step and not step % 1:
+                    print('step:{}, loss:{}, sim_loss:{}'.format(step, loss_, sim_loss_))
                 sess.run(training_op)
             else:
                 loss_= sess.run(loss)
